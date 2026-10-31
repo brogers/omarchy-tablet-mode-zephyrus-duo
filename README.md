@@ -4,6 +4,10 @@ An Omarchy bar widget and a user service that show the on-screen keyboard on the
 
 **Screen rotation is `zephyrus-duo-rotate`, not this plugin.** This plugin does not turn either panel, map touch, change window gaps, or claim the accelerometer. `zephyrus-duo-dock` is what powers the bottom panel off when the keyboard is seated.
 
+<p align="center">
+  <img src="docs/screenshots/tablet-landscape.png" width="70%" alt="The on-screen keyboard on the bottom panel while the magnetic keyboard is lifted: a US desktop layout across the bottom, and the round keyboard button above its right side">
+</p>
+
 Forked from [Alan Roman's ROG Flow Z13 plugin](https://github.com/AlanRoman117/omarchy-tablet-mode-asus-rog-flow-z13). The plugin id, command, and user service are different, so the two can be installed side by side. Tested on one machine: GX651AX (2026), Omarchy 4.0.0, Hyprland 0.57.0.
 
 ## What it does
@@ -43,6 +47,8 @@ zephyrus-duo-keyboard enable
 `enable` writes `~/.config/omarchy/zephyrus-duo-keyboard.conf`, starts `zephyrus-duo-keyboard.service`, adds the menu entries, installs a theme hook, and links `~/.local/bin/zephyrus-duo-keyboard`.
 
 ## The card
+
+<img src="docs/screenshots/card.png" width="360" align="right" alt="The Zephyrus Duo Keyboard card: dock status Lifted, the on-screen keyboard switch off, and Check and Turn off">
 
 Tap the bar icon:
 
