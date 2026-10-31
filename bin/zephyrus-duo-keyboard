@@ -1,0 +1,1049 @@
+#!/bin/bash
+
+# zephyrus-duo-keyboard: show the on-screen keyboard on the Zephyrus Duo's bottom panel.
+# Seating the magnetic keyboard (USB 0b05:1ce6) hides it. Lifting it does nothing unless
+# show_keyboard=true. Screen rotation belongs to zephyrus-duo-rotate.
+#
+# Forked from Alan Roman's ROG Flow Z13 tablet-mode plugin (MIT). This copy does not claim
+# the accelerometer, rotate a monitor, map touch, or change Hyprland gaps.
+#
+# Usage: zephyrus-duo-keyboard <command> [args]
+
+set -uo pipefail
+
+VERSION=0.1.2
+COMMAND=zephyrus-duo-keyboard
+PLUGIN_ID="brogers.zephyrus-duo-keyboard"
+SELF="$(readlink -f "$0")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONF="${TABLET_MODE_CONF:-$CONFIG_HOME/omarchy/zephyrus-duo-keyboard.conf}"
+RUN_DIR="${TABLET_MODE_RUN_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/zephyrus-duo-keyboard}"
+STATE="$RUN_DIR/state.json"
+FIFO="$RUN_DIR/events"
+DAEMON_PID="$RUN_DIR/daemon.pid"
+OSK_PID="$RUN_DIR/osk.pid"
+OSK_OUTPUT_FILE="$RUN_DIR/osk-output"
+READERS_DIR="$RUN_DIR/readers"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zephyrus-duo-keyboard"
+USB_DEVICES="${TABLET_MODE_USB_DEVICES:-/sys/bus/usb/devices}"
+UNIT="zephyrus-duo-keyboard.service"
+UNIT_FILE="$CONFIG_HOME/systemd/user/$UNIT"
+# Omarchy reads its menu extension, hooks and shell.json from ~/.config/omarchy whatever
+# XDG_CONFIG_HOME says, so these follow it there (the tests point them elsewhere).
+OMARCHY_CONFIG="${TABLET_MODE_OMARCHY_CONFIG:-$HOME/.config/omarchy}"
+MENU="$OMARCHY_CONFIG/extensions/omarchy-menu.jsonc"
+MENU_BEGIN="// >>> zephyrus-duo-keyboard: managed by $PLUGIN_ID (zephyrus-duo-keyboard disable --full removes this block)"
+MENU_END="// <<< zephyrus-duo-keyboard"
+HOOK="$OMARCHY_CONFIG/hooks/theme-set.d/zephyrus-duo-keyboard.sh"
+SHELL_JSON="$OMARCHY_CONFIG/shell.json"
+LINK="$HOME/.local/bin/zephyrus-duo-keyboard"
+THEME_COLORS="$HOME/.local/state/omarchy/current/theme/colors.toml"
+# On-screen keyboards, preferred first. The osk setting can pick one. Showing always pins
+# wvkbd-deskus --output; a build without --output is refused.
+OSK_BINS=(wvkbd-deskus wvkbd-mobintl)
+# Tests: TABLET_MODE_DRYRUN=1 logs keyboard actions to $TABLET_MODE_LOG instead of doing them.
+DRYRUN=${TABLET_MODE_DRYRUN:-0}
+DOCK=lifted
+OSK_VISIBLE=false
+ASLEEP=false
+
+# --- settings ------------------------------------------------------------------
+
+declare -A CFG=(
+  [enabled]=true
+  [keyboard]=0b05:1ce6
+  [auto_rotate]=false
+  [show_keyboard]=false
+  [touch_tweaks]=false
+  [notify]=true
+  [resume_delay_ms]=2000
+  [osk_height_landscape]=420
+  [osk_height_portrait]=420
+  [osk]=auto
+)
+
+load_config() {
+  [[ -f $CONF ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*([a-z_]+)[[:space:]]*=[[:space:]]*([^#[:space:]]*) ]] || continue
+    [[ -v CFG[${BASH_REMATCH[1]}] ]] && CFG[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+  done <"$CONF"
+}
+
+cfg_bool() { [[ ${CFG[$1]} == true ]]; }
+
+cfg_int() {
+  local value=${CFG[$1]}
+  if [[ $value =~ ^[0-9]{1,5}$ ]]; then echo "$((10#$value))"; else echo "$2"; fi
+}
+
+write_default_config() {
+  mkdir -p "$(dirname "$CONF")"
+  cat >"$CONF" <<'EOF'
+# Zephyrus Duo keyboard (brogers.zephyrus-duo-keyboard).
+# Edit, then: systemctl --user restart zephyrus-duo-keyboard
+
+# false = nothing runs (zephyrus-duo-keyboard disable / enable).
+enabled=true
+
+# USB id of the magnetic keyboard while it is seated on the bottom panel.
+# Present = seated (hide the on-screen keyboard). Absent = lifted.
+keyboard=0b05:1ce6
+
+# Ignored. Screen rotation is zephyrus-duo-rotate.
+auto_rotate=false
+
+# true = show the on-screen keyboard whenever the magnetic keyboard is lifted.
+# Leave false when another keyboard (a Corne, for example) is in use.
+show_keyboard=false
+
+# Ignored. This plugin does not change Hyprland gaps.
+touch_tweaks=false
+EOF
+}
+
+# set_config <key> <value>: keys and values come from this script, never from the user.
+set_config() {
+  [[ -f $CONF ]] || write_default_config
+  if grep -qE "^[[:space:]]*$1[[:space:]]*=" "$CONF"; then
+    sed -i --follow-symlinks -E "s|^[[:space:]]*$1[[:space:]]*=.*|$1=$2|" "$CONF"
+  else
+    printf '%s=%s\n' "$1" "$2" >>"$CONF"
+  fi
+  CFG[$1]=$2
+}
+
+# --- output helpers ------------------------------------------------------------
+
+ok() { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad() { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+note() { printf '  \033[33m•\033[0m %s\n' "$*"; }
+step() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+die() { printf '\033[31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+log() { printf '%s\n' "$*" >&2; }
+action() { printf '%s\n' "$*" >>"${TABLET_MODE_LOG:-/dev/stderr}"; }
+
+YES=0
+confirm() {
+  ((YES)) && return 0
+  if command -v gum >/dev/null && [[ -t 0 ]]; then
+    gum confirm "$1"
+  else
+    local reply
+    read -r -p "$1 [y/N] " reply
+    [[ $reply == [yY]* ]]
+  fi
+}
+
+notify() {
+  if ((DRYRUN)); then action "notify $1: $2"; return 0; fi
+  if command -v omarchy-notification-send >/dev/null; then
+    omarchy-notification-send "$1" "$2" -t 4000 >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null; then
+    notify-send -a "Zephyrus Duo Keyboard" "$1" "$2" >/dev/null 2>&1 || true
+  fi
+}
+
+refresh_widget() {
+  ((DRYRUN)) && return 0
+  command -v omarchy-shell >/dev/null && omarchy-shell "$PLUGIN_ID" refresh >/dev/null 2>&1 || true
+}
+
+now_ms() {
+  local t=${EPOCHREALTIME//[.,]/}
+  echo $((10#$t / 1000))
+}
+
+json_bool() { [[ $1 == true ]] && echo true || echo false; }
+
+# Screen rotation, rotation lock, and calibration are not this plugin's commands.
+refuse_rotation() {
+  printf '%s\n' "Screen rotation is zephyrus-duo-rotate, not this plugin." >&2
+  exit 1
+}
+
+# --- dock and panels -------------------------------------------------------------
+
+# seated while keyboard= (default 0b05:1ce6) is on the USB bus, otherwise lifted.
+# 0b05:1a30 (Z13 keyboard) and 0b05:193b (ITE controller) are never special-cased.
+dock_state() {
+  local want=${CFG[keyboard],,} dev id
+  [[ $want =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]] || { echo lifted; return; }
+  for dev in "$USB_DEVICES"/*; do
+    [[ -f $dev/idVendor && -f $dev/idProduct ]] || continue
+    id="$(<"$dev/idVendor"):$(<"$dev/idProduct")"
+    id=${id,,}
+    if [[ $id == "$want" ]]; then
+      echo seated
+      return
+    fi
+  done
+  echo lifted
+}
+
+# zephyrus-duo-panels prints: top= bottom= top_backlight= bottom_backlight=
+# Only connector tokens are accepted. bottom wins; an empty bottom uses top.
+osk_output() {
+  local line top bottom out
+  command -v zephyrus-duo-panels >/dev/null || return 1
+  line=$(zephyrus-duo-panels 2>/dev/null) || return 1
+  [[ $line =~ ^top=([A-Za-z0-9._-]*)[[:space:]]+bottom=([A-Za-z0-9._-]*)([[:space:]]|$) ]] || return 1
+  top=${BASH_REMATCH[1]}
+  bottom=${BASH_REMATCH[2]}
+  out=$bottom
+  [[ -n $out ]] || out=$top
+  [[ $out =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+panels_have_top() {
+  local line
+  command -v zephyrus-duo-panels >/dev/null || return 1
+  line=$(zephyrus-duo-panels 2>/dev/null) || return 1
+  [[ $line =~ ^top=([A-Za-z0-9._-]+)[[:space:]] ]]
+}
+
+# --- on-screen keyboard (wvkbd) ----------------------------------------------------
+
+osk_bin() {
+  local want=${CFG[osk]} bin
+  if [[ $want =~ ^wvkbd-[a-z]+$ ]]; then
+    command -v "$want" >/dev/null && echo "$want"
+    return
+  fi
+  for bin in "${OSK_BINS[@]}"; do
+    command -v "$bin" >/dev/null && { echo "$bin"; return; }
+  done
+  return 1
+}
+
+osk_running() {
+  local pid
+  pid=$(cat "$OSK_PID" 2>/dev/null) && [[ $pid =~ ^[0-9]+$ ]] && ((pid > 1)) && [[ $(cat "/proc/$pid/comm" 2>/dev/null) == wvkbd* ]] && echo "$pid"
+}
+
+osk_color() {
+  local value
+  value=$(sed -nE "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"#?([0-9A-Fa-f]{6})\".*/\1/p" "$THEME_COLORS" 2>/dev/null | head -1)
+  echo "${value:-$2}"
+}
+
+osk_start() {
+  local out bin help args
+  out=$(osk_output) || { log "No panel to pin the on-screen keyboard to"; return 1; }
+  if ((DRYRUN)); then action "osk start $out"; echo dry >"$OSK_PID"; printf '%s\n' "$out" >"$OSK_OUTPUT_FILE"; return 0; fi
+  bin=$(osk_bin) || { log "No on-screen keyboard installed ($COMMAND install)"; return 1; }
+  help=$("$bin" --help 2>&1 || true)
+  [[ $help == *--output* ]] || { log "$bin has no --output; install wvkbd-deskus"; return 1; }
+  args=(-L "$(cfg_int osk_height_landscape 420)" -H "$(cfg_int osk_height_portrait 420)" --output "$out")
+  [[ $help == *--hidden* ]] && args+=(--hidden)
+  if [[ -f $THEME_COLORS ]]; then
+    local bg dark lighter fg accent flag
+    bg=$(osk_color background 1e1e2e) dark=$(osk_color darker_background "$bg")
+    lighter=$(osk_color lighter_background "$bg") fg=$(osk_color foreground cdd6f4) accent=$(osk_color accent 89b4fa)
+    for flag in "--bg $dark" "--fg $lighter" "--fg-sp $bg" "--press $accent" "--press-sp $accent" "--text $fg" "--text-sp $fg"; do
+      if [[ $help == *"${flag% *} "* ]]; then
+        # shellcheck disable=SC2206
+        args+=($flag)
+      fi
+    done
+  fi
+  "$bin" "${args[@]}" >/dev/null 2>&1 3<&- &
+  echo $! >"$OSK_PID"
+  printf '%s\n' "$out" >"$OSK_OUTPUT_FILE"
+  sleep 0.3
+  [[ $help == *--hidden* ]] || kill -USR1 $! 2>/dev/null || true
+}
+
+osk_show() {
+  local out pid
+  out=$(osk_output) || { log "No panel to pin the on-screen keyboard to"; return 1; }
+  if ((DRYRUN)); then
+    action "osk show $out"
+    OSK_VISIBLE=true
+    echo dry >"$OSK_PID"
+    printf '%s\n' "$out" >"$OSK_OUTPUT_FILE"
+    return 0
+  fi
+  # A Hyprland reload drops the layer. If the pinned connector changed, start again on the new one.
+  if [[ -f $OSK_OUTPUT_FILE && $(<"$OSK_OUTPUT_FILE") != "$out" ]]; then
+    osk_stop
+  fi
+  pid=$(osk_running) || { osk_start || return 1; pid=$(osk_running) || return 1; }
+  kill -USR2 "$pid" 2>/dev/null && OSK_VISIBLE=true
+}
+
+osk_hide() {
+  OSK_VISIBLE=false
+  if ((DRYRUN)); then action "osk hide"; return 0; fi
+  local pid
+  pid=$(osk_running) && kill -USR1 "$pid" 2>/dev/null
+  return 0
+}
+
+osk_stop() {
+  OSK_VISIBLE=false
+  if ((DRYRUN)); then
+    [[ -f $OSK_PID ]] && action "osk stop"
+    rm -f "$OSK_PID" "$OSK_OUTPUT_FILE"
+    return 0
+  fi
+  local pid
+  if pid=$(osk_running); then
+    # Hide first: wvkbd lets go of a held key when it hides, but not when killed.
+    kill -USR1 "$pid" 2>/dev/null && sleep 0.15
+    kill "$pid" 2>/dev/null
+  fi
+  rm -f "$OSK_PID" "$OSK_OUTPUT_FILE"
+}
+
+osk_restyle() {
+  [[ -f $OSK_PID ]] || return 0
+  local was=$OSK_VISIBLE
+  osk_stop
+  osk_start || return 1
+  [[ $was == true ]] && osk_show
+  return 0
+}
+
+# --- event readers (each writes one line per event into the daemon's FIFO) ---------
+
+cmd__usb_reader() {
+  local line
+  while true; do
+    stdbuf -oL udevadm monitor --udev --subsystem-match=usb/usb_device 2>/dev/null | while IFS= read -r line; do
+      [[ $line == UDEV* ]] && echo usb
+    done
+    sleep 2
+  done
+}
+
+cmd__hypr_reader() {
+  local socket="${XDG_RUNTIME_DIR:-}/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-}/.socket2.sock" line
+  while true; do
+    socat -U - "UNIX-CONNECT:$socket" 2>/dev/null | while IFS= read -r line; do
+      case $line in
+        configreloaded*) echo "hypr reload" ;;
+      esac
+    done
+    sleep 2
+  done
+}
+
+# logind's PrepareForSleep: true just before suspend, false after resume.
+# Hiding the on-screen keyboard is the only reaction. There is no sleep inhibitor.
+cmd__sleep_reader() {
+  local line
+  while true; do
+    stdbuf -oL gdbus monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 2>/dev/null |
+      while IFS= read -r line; do
+        case $line in
+          *": org.freedesktop.login1.Manager.PrepareForSleep (true,)"*) echo "sleep pre" ;;
+          *": org.freedesktop.login1.Manager.PrepareForSleep (false,)"*) echo "sleep post" ;;
+        esac
+      done
+    sleep 2
+  done
+}
+
+pid_of() {
+  local pid
+  pid=$(cat "$1" 2>/dev/null) || return 1
+  [[ $pid =~ ^[0-9]+$ ]] && ((pid > 1)) || return 1
+  { tr '\0' ' ' <"/proc/$pid/cmdline"; } 2>/dev/null | grep -qF -- "$2" || return 1
+  echo "$pid"
+}
+
+spawn_group() {
+  local pidfile=$1
+  shift
+  rm -f "$pidfile"
+  setsid bash -c 'echo $$ >"$0" && exec "$@"' "$pidfile" "$@" &
+  local launcher=$!
+  for _ in {1..80}; do
+    [[ -s $pidfile ]] && return 0
+    sleep 0.025
+  done
+  kill "$launcher" 2>/dev/null
+  return 1
+}
+
+start_reader() {
+  local name=$1
+  if ((DRYRUN)); then
+    [[ -f $READERS_DIR/$name ]] || { action "reader start $name"; echo dry >"$READERS_DIR/$name"; }
+    return 0
+  fi
+  reader_running "$name" && return 0
+  spawn_group "$READERS_DIR/$name" "$SELF" "_$name-reader" >"$FIFO" 2>/dev/null 3<&- ||
+    log "The $name reader didn't start"
+}
+
+stop_reader() {
+  local name=$1 pid
+  [[ -f $READERS_DIR/$name ]] || return 0
+  if ((DRYRUN)); then rm -f "$READERS_DIR/$name"; action "reader stop $name"; return 0; fi
+  pid=$(pid_of "$READERS_DIR/$name" "_$name-reader")
+  rm -f "$READERS_DIR/$name"
+  [[ -n $pid ]] || return 0
+  kill -- "-$pid" 2>/dev/null
+  for _ in {1..40}; do
+    kill -0 -- "-$pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  return 0
+}
+
+reader_running() { pid_of "$READERS_DIR/$1" "_$1-reader" >/dev/null; }
+
+# --- daemon -----------------------------------------------------------------------------
+
+daemon_running() {
+  local pid
+  pid=$(cat "$DAEMON_PID" 2>/dev/null) || return 1
+  [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- "$COMMAND daemon" || return 1
+  echo "$pid"
+}
+
+write_state() {
+  mkdir -p "$RUN_DIR"
+  local out
+  out=$(osk_output 2>/dev/null || true)
+  jq -n --arg keyboard "${CFG[keyboard]}" --arg dock "$DOCK" --arg osk_output "$out" \
+    --argjson osk "$(json_bool "$OSK_VISIBLE")" --argjson pid "$$" \
+    --argjson asleep "$(json_bool "$ASLEEP")" \
+    '{running: true, pid: $pid, keyboard: $keyboard, dock: $dock, osk: $osk, osk_output: $osk_output, asleep: $asleep}' \
+    >"$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+}
+
+# USB that drops off the bus for a moment (resume, a loose connector) waits until it has
+# been quiet. Present hides the on-screen keyboard. Absent follows show_keyboard only.
+on_usb() { KBD_PENDING=$(now_ms); }
+
+on_usb_settled() {
+  local now
+  now=$(dock_state)
+  [[ $now == "$DOCK" ]] && return 0
+  DOCK=$now
+  log "dock: $DOCK"
+  if [[ $DOCK == seated ]]; then
+    osk_hide
+  elif cfg_bool show_keyboard; then
+    osk_show
+  else
+    osk_hide
+  fi
+  write_state
+}
+
+# After Hyprland reloads (the rotator does this on orientation and on dock), a visible
+# keyboard has to be shown again or its layer is gone. Nothing else happens here.
+on_hypr() {
+  case $1 in
+    reload) [[ $OSK_VISIBLE == true ]] && osk_show ;;
+  esac
+  return 0
+}
+
+on_sleep() {
+  case $1 in
+    pre)
+      ASLEEP=true
+      RESUME_AT=""
+      OSK_RESTORE=$OSK_VISIBLE
+      log "sleep: hiding the on-screen keyboard"
+      [[ $OSK_VISIBLE == true ]] && osk_hide
+      write_state
+      ;;
+    post)
+      [[ $ASLEEP == true ]] && RESUME_AT=$(now_ms)
+      ;;
+  esac
+  return 0
+}
+
+on_command() {
+  case "${1:-} ${2:-}" in
+    "on "* | "osk show") osk_show || true ;;
+    "off "* | "osk hide") osk_hide ;;
+    "toggle "* | "osk toggle")
+      if [[ $OSK_VISIBLE == true ]]; then osk_hide; else osk_show || true; fi
+      ;;
+    "osk restyle") osk_restyle || true ;;
+    "refresh "*) ;;
+  esac
+  write_state
+  return 0
+}
+
+handle_event() {
+  local kind arg
+  read -r kind arg <<<"$1"
+  case $kind in
+    usb) on_usb ;;
+    hypr) on_hypr "$arg" ;;
+    sleep) on_sleep "$arg" ;;
+    cmd)
+      local -a words
+      read -ra words <<<"$arg"
+      on_command "${words[@]}"
+      ;;
+  esac
+}
+
+apply_pending() {
+  local now
+  now=$(now_ms)
+  if [[ -n ${RESUME_AT:-} ]] && ((now - RESUME_AT >= $(cfg_int resume_delay_ms 2000))); then
+    RESUME_AT=""
+    ASLEEP=false
+    log "awake"
+    # Seating while asleep still wins: the keyboard stays hidden.
+    if [[ ${OSK_RESTORE:-false} == true && $DOCK != seated ]]; then
+      osk_show || true
+    fi
+    write_state
+    KBD_PENDING=$now
+  fi
+  if [[ -n ${KBD_PENDING:-} ]] && ((now - KBD_PENDING >= 800)); then
+    KBD_PENDING=""
+    on_usb_settled
+  fi
+}
+
+daemon_exit() {
+  IFS=$' \t\n'
+  local name
+  for name in usb hypr sleep; do stop_reader "$name"; done
+  restore_live
+  rm -f "$DAEMON_PID" "$FIFO"
+}
+
+cmd_daemon() {
+  local readers=1 pid line rc
+  [[ ${1:-} == --no-readers ]] && readers=0
+  load_config
+  cfg_bool enabled || { log "Zephyrus Duo keyboard is disabled ($CONF)"; exit 0; }
+  mkdir -p "$RUN_DIR" "$READERS_DIR"
+  pid=$(daemon_running) && die "Already running (pid $pid)"
+  echo $$ >"$DAEMON_PID"
+  local stale
+  for stale in usb hypr sleep; do ((DRYRUN)) || stop_reader "$stale"; done
+  rm -f "$READERS_DIR"/*
+  rm -f "$FIFO"
+  mkfifo -m 600 "$FIFO" || die "Can't create $FIFO"
+  exec 3<>"$FIFO"
+  trap daemon_exit EXIT
+  trap 'exit 0' TERM INT HUP
+
+  DOCK=$(dock_state)
+  OSK_VISIBLE=false
+  ASLEEP=false
+  KBD_PENDING=""
+  RESUME_AT=""
+  OSK_RESTORE=false
+
+  if ((readers)); then
+    start_reader usb
+    start_reader hypr
+    start_reader sleep
+  fi
+  if [[ $DOCK == lifted ]] && cfg_bool show_keyboard; then
+    osk_show || true
+  fi
+  write_state
+  log "dock: $DOCK"
+
+  while true; do
+    if [[ -n ${KBD_PENDING:-} || -n ${RESUME_AT:-} ]]; then
+      IFS= read -r -t 0.1 line <&3
+      rc=$?
+    else
+      IFS= read -r line <&3
+      rc=$?
+    fi
+    ((rc == 0)) && handle_event "$line"
+    apply_pending
+  done
+}
+
+# Stop wvkbd. Does not move panels or restore gaps.
+restore_live() {
+  osk_stop
+  rm -f "$STATE"
+}
+
+# --- commands ---------------------------------------------------------------------------
+
+require_enabled() {
+  load_config
+  cfg_bool enabled || die "Zephyrus Duo keyboard is disabled. Turn it back on with: $COMMAND enable"
+}
+
+send() {
+  daemon_running >/dev/null || die "The $COMMAND service isn't running (try: $COMMAND doctor)"
+  timeout 2 bash -c 'printf "%s\n" "$1" >"$2"' _ "$*" "$FIFO" || die "The $COMMAND service didn't respond"
+}
+
+cmd_mode() {
+  require_enabled
+  send "cmd $1"
+}
+
+cmd_osk() {
+  load_config
+  case ${1:-toggle} in
+    restyle) cfg_bool enabled && daemon_running >/dev/null && send "cmd osk restyle"; return 0 ;;
+    show | hide | toggle) require_enabled; send "cmd osk ${1:-toggle}" ;;
+    *) die "Usage: $COMMAND osk show|hide|toggle" ;;
+  esac
+}
+
+packages_missing() {
+  command -v wvkbd-deskus >/dev/null || echo wvkbd-deskus
+}
+
+osk_recipe_version() {
+  local f="$ROOT/packaging/wvkbd-deskus/PKGBUILD"
+  [[ -f $f ]] || return 1
+  echo "$(sed -n 's/^pkgver=//p' "$f")-$(sed -n 's/^pkgrel=//p' "$f")"
+}
+osk_installed_version() { pacman -Q wvkbd-deskus 2>/dev/null | awk '{print $2}'; }
+
+osk_outdated() {
+  local have want
+  have=$(osk_installed_version) want=$(osk_recipe_version) || return 1
+  [[ -n $have ]] && command -v vercmp >/dev/null && (($(vercmp "$have" "$want") < 0))
+}
+
+setup_state() {
+  cfg_bool enabled || { echo disabled; return; }
+  [[ -z $(packages_missing) ]] || { echo install; return; }
+  systemctl --user is-enabled --quiet "$UNIT" 2>/dev/null || { echo enable; return; }
+  systemctl --user is-active --quiet "$UNIT" 2>/dev/null || { echo stopped; return; }
+  echo ready
+}
+
+status_json() {
+  local live='{}' enabled=false dock out
+  daemon_running >/dev/null && [[ -f $STATE ]] && live=$(cat "$STATE")
+  cfg_bool enabled && enabled=true
+  dock=$(dock_state)
+  out=$(osk_output 2>/dev/null || true)
+  jq -c --argjson enabled "$enabled" --arg setup "$(setup_state)" --arg version "$VERSION" \
+    --arg keyboard "${CFG[keyboard]}" --arg dock "$dock" --arg osk_output "$out" \
+    '{version: $version, enabled: $enabled, setup: $setup, keyboard: $keyboard,
+      dock: $dock, osk_output: $osk_output, running: false, osk: false} + .' <<<"$live"
+}
+
+cmd_status() {
+  local json=0 is="" st
+  while (($#)); do
+    case $1 in
+      --json) json=1 ;;
+      --is) is=${2:-} && shift ;;
+      *) die "Unknown option $1" ;;
+    esac
+    shift
+  done
+  load_config
+  st=$(status_json)
+  if [[ -n $is ]]; then
+    case $is in
+      enabled) jq -e '.enabled' <<<"$st" >/dev/null ;;
+      running) jq -e '.running' <<<"$st" >/dev/null ;;
+      osk) jq -e '.osk' <<<"$st" >/dev/null ;;
+      seated) jq -e '.dock == "seated"' <<<"$st" >/dev/null ;;
+      lifted) jq -e '.dock == "lifted"' <<<"$st" >/dev/null ;;
+      *) die "Usage: $COMMAND status --is enabled|running|osk|seated|lifted" ;;
+    esac
+    return
+  fi
+  ((json)) && { echo "$st"; return; }
+  jq -r '"Zephyrus Duo keyboard \(.version)",
+    "  plugin       \(if .enabled then "enabled" else "disabled" end)",
+    "  setup        \(.setup)",
+    "  service      \(if .running then "running" else "not running" end)",
+    "  dock         \(.dock) (\(.keyboard))",
+    "  on-screen kb \(if .osk then "shown" else "hidden" end)",
+    "  output       \(.osk_output)"' <<<"$st"
+}
+
+BUILD_DIR=""
+build_reviewed() {
+  local src=$1 pkg dir file
+  pkg=$(basename "$src")
+  command -v makepkg >/dev/null || die "Needs base-devel (makepkg) to build $pkg"
+  [[ -f $src/PKGBUILD && ! -L $src ]] || die "No recipe at $src"
+  dir=$(mktemp -d) || die "Can't create a build folder"
+  BUILD_DIR=$dir
+  trap '[[ -n $BUILD_DIR ]] && rm -rf "$BUILD_DIR"' EXIT
+  trap 'exit 130' INT TERM
+  cp -RP "$src" "$dir/$pkg"
+  [[ -z $(find "$dir/$pkg" -mindepth 1 ! -type f -print -quit) ]] || die "The recipe at $src contains something other than plain files; refusing to build it"
+  step "$pkg: the complete recipe that will be built"
+  while IFS= read -r file; do
+    echo "  ── ${file#"$dir/$pkg/"}"
+    cat -v "$file" | sed 's/^/  | /'
+  done < <(find "$dir/$pkg" -type f | sort)
+  echo
+  local YES=0
+  confirm "Build and install $pkg from this recipe?" || die "Not installed"
+  (cd "$dir/$pkg" && makepkg --syncdeps --install --needed) || die "Building $pkg failed"
+  rm -rf "$dir"
+  BUILD_DIR=""
+}
+
+cmd_install() {
+  while (($#)); do case $1 in -y | --yes) YES=1 ;; *) die "Unknown option $1" ;; esac; shift; done
+  local missing
+  missing=$(packages_missing | xargs)
+  command -v wvkbd-deskus >/dev/null || [[ $missing == *wvkbd-deskus* ]] || missing+=" wvkbd-deskus"
+  osk_outdated && [[ $missing != *wvkbd-deskus* ]] && missing+=" wvkbd-deskus"
+  missing=$(xargs <<<"$missing")
+  step "Install"
+  if [[ -z $missing ]]; then
+    ok "wvkbd-deskus is installed"
+    echo
+    echo "Next: $COMMAND enable"
+    return 0
+  fi
+  echo "  This installs (it asks for your password):"
+  osk_outdated && echo "   - an update of wvkbd-deskus, $(osk_installed_version) -> $(osk_recipe_version):"
+  echo "   - wvkbd-deskus: the on-screen keyboard with a US desktop layout, built from this plugin's"
+  echo "     recipe: wvkbd 0.20 from upstream plus three small patches (US layout; held keys stay"
+  echo "     down until the finger lifts; the keyboard stays on one screen). You'll see all of"
+  echo "     it first, and it's built only if you say yes, even with --yes."
+  confirm "Continue?" || exit 1
+  if [[ $missing == *wvkbd-deskus* ]]; then
+    build_reviewed "$ROOT/packaging/wvkbd-deskus"
+  fi
+  missing=$(packages_missing | xargs)
+  [[ -z $missing ]] || die "Still missing: $missing"
+  command -v wvkbd-deskus >/dev/null || die "wvkbd-deskus didn't install"
+  osk_outdated && die "wvkbd-deskus is still the older build ($(osk_installed_version))"
+  ok "Installed"
+  systemctl --user try-restart "$UNIT" 2>/dev/null && systemctl --user is-active --quiet "$UNIT" && ok "Service restarted with the new keyboard"
+  echo
+  echo "Next: $COMMAND enable"
+}
+
+install_unit() {
+  mkdir -p "$(dirname "$UNIT_FILE")"
+  sed "s|@BIN@|$SELF|g" "$ROOT/systemd/$UNIT" >"$UNIT_FILE.tmp" && mv -f "$UNIT_FILE.tmp" "$UNIT_FILE"
+}
+
+install_hook() {
+  mkdir -p "$(dirname "$HOOK")"
+  cat >"$HOOK" <<EOF
+#!/bin/bash
+# Restyles the on-screen keyboard for the new theme ($PLUGIN_ID).
+[[ -x "$SELF" ]] && "$SELF" osk restyle >/dev/null 2>&1
+exit 0
+EOF
+}
+
+menu_block() {
+  local cli=$SELF
+  echo "  $MENU_BEGIN"
+  [[ -n ${1:-} ]] && echo "  ,"
+  cat <<EOF
+  "trigger.toggle.zephyrus-duo-keyboard-osk": {"icon":"󰌌","label":"On-screen Keyboard","when":"$cli status --is running","checked":"$cli status --is osk","action":"$cli osk toggle"},
+  "trigger.toggle.zephyrus-duo-keyboard-plugin": {"icon":"󰐥","label":"Zephyrus Duo Keyboard","checked":"$cli status --is enabled","action":"$cli plugin-toggle"},
+  $MENU_END
+EOF
+}
+
+menu_remove() {
+  [[ -f $MENU ]] || return 0
+  local begins ends tmp keep
+  begins=$(grep -n '^[[:space:]]*// >>> zephyrus-duo-keyboard:' "$MENU" | cut -d: -f1)
+  ends=$(grep -n '^[[:space:]]*// <<< zephyrus-duo-keyboard' "$MENU" | cut -d: -f1)
+  [[ -z $begins && -z $ends ]] && return 0
+  if ! [[ $begins =~ ^[0-9]+$ && $ends =~ ^[0-9]+$ ]] || ((begins >= ends)); then
+    note "The zephyrus-duo-keyboard block in $MENU is damaged (markers missing or out of order); fix or remove it by hand"
+    return 1
+  fi
+  tmp=$(mktemp) || return 1
+  for keep in "" ","; do
+    { head -n $((begins - 1)) "$MENU"; [[ -n $keep ]] && echo "  ,"; tail -n +$((ends + 1)) "$MENU"; } >"$tmp"
+    if jsonc_ok "$tmp" 2>/dev/null; then
+      cat "$tmp" >"$MENU"
+      rm -f "$tmp"
+      [[ -n $keep ]] && note "Left a lone comma where the zephyrus-duo-keyboard block was: an entry after it needs it"
+      return 0
+    fi
+  done
+  rm -f "$tmp"
+  note "Removing the zephyrus-duo-keyboard block would leave $MENU unparseable; fix or remove it by hand"
+  return 1
+}
+
+jsonc_ok() {
+  command -v python3 >/dev/null || return 2
+  python3 -I - "$1" <<'PY'
+import json, re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+out, i, n = [], 0, len(src)
+while i < n:
+    c = src[i]
+    if c == '"':
+        j = i + 1
+        while j < n and src[j] != '"':
+            j += 2 if src[j] == "\\" else 1
+        out.append(src[i:j + 1]); i = j + 1
+    elif src.startswith("//", i):
+        while i < n and src[i] != "\n": i += 1
+    elif src.startswith("/*", i):
+        i = src.find("*/", i + 2); i = n if i < 0 else i + 2
+    else:
+        out.append(c); i += 1
+json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
+PY
+}
+
+menu_add() {
+  menu_remove || { note "Menu entries skipped"; return 0; }
+  if [[ ! -f $MENU ]]; then
+    mkdir -p "$(dirname "$MENU")"
+    printf '{\n}\n' >"$MENU"
+  fi
+  jsonc_ok "$MENU"
+  case $? in
+    1) note "$MENU doesn't parse as it is; menu entries skipped"; return 0 ;;
+    2) note "python3 is needed to edit $MENU safely; menu entries skipped"; return 0 ;;
+  esac
+  [[ -f $MENU.zephyrus-duo-keyboard.bak ]] || cp -pL "$MENU" "$MENU.zephyrus-duo-keyboard.bak"
+  local last tmp comma
+  last=$(grep -n '^[[:space:]]*}[[:space:]]*$' "$MENU" | tail -1 | cut -d: -f1)
+  [[ -n $last ]] || { note "Couldn't find the end of $MENU; menu entries skipped"; return 0; }
+  tmp=$(mktemp)
+  for comma in "" ","; do
+    { head -n $((last - 1)) "$MENU"; menu_block "$comma"; tail -n +"$last" "$MENU"; } >"$tmp"
+    if jsonc_ok "$tmp" 2>/dev/null; then
+      cat "$tmp" >"$MENU"
+      rm -f "$tmp"
+      return 0
+    fi
+  done
+  rm -f "$tmp"
+  note "Couldn't add the menu entries to $MENU without breaking it; skipped"
+}
+
+plugin_on_bar() { grep -qF "\"$PLUGIN_ID\"" "$SHELL_JSON" 2>/dev/null; }
+
+require_plain_paths() {
+  local path
+  for path in "$SELF" "$LINK"; do
+    [[ $path =~ ^[A-Za-z0-9._/+-]+$ ]] || die "Unsupported characters in $path; install the plugin under a plain path"
+  done
+}
+
+cmd_enable() {
+  require_plain_paths
+  load_config
+  [[ -f $CONF ]] || write_default_config
+  set_config enabled true
+  step "Enable Zephyrus Duo keyboard"
+  local missing
+  missing=$(packages_missing | xargs)
+  [[ -z $missing ]] || note "Not installed yet: $missing (run: $COMMAND install)"
+  install_unit
+  mkdir -p "$(dirname "$LINK")"
+  if [[ -e $LINK && ! -L $LINK ]]; then
+    note "$LINK is someone else's file, so it's left alone: run $COMMAND as $SELF"
+  else
+    ln -sfn "$SELF" "$LINK"
+  fi
+  install_hook
+  menu_add
+  systemctl --user daemon-reload
+  systemctl --user enable "$UNIT" >/dev/null 2>&1
+  systemctl --user restart "$UNIT" || die "The service didn't start (journalctl --user -u $UNIT)"
+  ok "Service running ($UNIT)"
+  ok "Menu entries under Trigger > Toggle; theme hook installed"
+  if ! plugin_on_bar && command -v omarchy-plugin-enable >/dev/null; then
+    omarchy-plugin-enable "$PLUGIN_ID" --section right >/dev/null 2>&1 && ok "Bar icon added"
+  fi
+  refresh_widget
+}
+
+MENU_KEPT=0
+cmd_disable() {
+  local full=0
+  [[ ${1:-} == --full ]] && full=1
+  load_config
+  set_config enabled false
+  step "Disable Zephyrus Duo keyboard"
+  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
+  restore_live
+  ok "On-screen keyboard stopped"
+  ok "Nothing starts at login"
+  if ((full)); then
+    if menu_remove; then ok "Menu entries removed"; else MENU_KEPT=1; fi
+    rm -f "$HOOK"
+    if plugin_on_bar && command -v omarchy-plugin-disable >/dev/null; then
+      omarchy-plugin-disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+    fi
+    ok "Theme hook and bar icon removed"
+    echo
+    echo "Bring it all back with: $COMMAND enable"
+  else
+    echo
+    echo "Turn it back on with: $COMMAND enable"
+  fi
+  refresh_widget
+}
+
+cmd_plugin_toggle() {
+  load_config
+  if cfg_bool enabled; then cmd_disable; else cmd_enable; fi
+}
+
+cmd_restore() {
+  daemon_running >/dev/null && die "The service is running; use: $COMMAND off, or $COMMAND disable"
+  restore_live
+  [[ ${1:-} == --quiet ]] || ok "On-screen keyboard stopped"
+}
+
+proc_ppid() { awk '/^PPid:/ {print $2}' "/proc/$1/status" 2>/dev/null; }
+
+descended_from() {
+  local pid=$1 root=$2 guard=0
+  while [[ $pid =~ ^[0-9]+$ ]] && ((pid > 1 && guard < 40)); do
+    pid=$(proc_ppid "$pid") || return 1
+    [[ $pid == "$root" ]] && return 0
+    guard=$((guard + 1))
+  done
+  return 1
+}
+
+# True when neither this process nor the daemon has a monitor-sensor descendant.
+no_monitor_sensor_child() {
+  local pid root
+  local -a roots=("$$")
+  root=$(daemon_running || true)
+  [[ -n $root ]] && roots+=("$root")
+  while read -r pid; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    for root in "${roots[@]}"; do
+      descended_from "$pid" "$root" && return 1
+    done
+  done < <(pgrep -u "$(id -u)" -x monitor-sensor || true)
+  return 0
+}
+
+rotate_running() {
+  local pid cmd
+  while read -r pid; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    [[ $cmd == *pgrep* ]] && continue
+    [[ $cmd == *zephyrus-duo-rotate* ]] && return 0
+  done < <(pgrep -u "$(id -u)" -f zephyrus-duo-rotate || true)
+  return 1
+}
+
+cmd_doctor() {
+  local fails=0 dock out
+  load_config
+  check() {
+    if "${@:2}" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fails=$((fails + 1)); fi
+  }
+  step "Zephyrus Duo keyboard"
+  check "wvkbd-deskus installed" command -v wvkbd-deskus
+  osk_outdated && note "wvkbd-deskus $(osk_installed_version) is older than this plugin's recipe ($(osk_recipe_version)); run: $COMMAND install"
+  check "zephyrus-duo-panels returns a top panel" panels_have_top
+  check "zephyrus-duo-rotate is running" rotate_running
+  check "No monitor-sensor child of this plugin" no_monitor_sensor_child
+  check "keyboard is 0b05:1ce6" test "${CFG[keyboard],,}" = "0b05:1ce6"
+  dock=$(dock_state)
+  note "Dock: $dock"
+  if out=$(osk_output); then
+    note "On-screen keyboard output: $out"
+  else
+    bad "No output to pin the on-screen keyboard to"
+    fails=$((fails + 1))
+  fi
+  echo
+  if ((fails)); then echo "$fails check(s) failed"; return 1; fi
+  echo "All good"
+}
+
+cmd_uninstall() {
+  local packages=0
+  [[ ${1:-} == --packages ]] && packages=1
+  cmd_disable --full
+  step "Uninstall"
+  rm -f "$UNIT_FILE"
+  systemctl --user daemon-reload
+  [[ -L $LINK && $(readlink -f "$LINK") == "$SELF" ]] && rm -f "$LINK"
+  [[ $(basename "$RUN_DIR") == zephyrus-duo-keyboard ]] && rm -rf "$RUN_DIR"
+  [[ $(basename "$STATE_DIR") == zephyrus-duo-keyboard ]] && rm -rf "$STATE_DIR"
+  if ((MENU_KEPT)); then
+    ok "Service and ~/.local/bin/$COMMAND removed"
+    note "The menu backup stays ($MENU.zephyrus-duo-keyboard.bak), since the menu entries couldn't be removed"
+  else
+    rm -f "$MENU.zephyrus-duo-keyboard.bak"
+    ok "Service, ~/.local/bin/$COMMAND and the menu backup removed"
+  fi
+  if [[ -f $CONF ]] && confirm "Delete your settings ($CONF)?"; then rm -f "$CONF" && ok "Settings deleted"; fi
+  if ((packages)) && pacman -Q wvkbd-deskus >/dev/null 2>&1 && confirm "Also uninstall wvkbd-deskus, the on-screen keyboard this plugin built (sudo)?"; then
+    sudo pacman -Rns wvkbd-deskus
+  fi
+  echo
+  echo "The plugin's files are still in $ROOT; remove them with: omarchy plugin remove $PLUGIN_ID"
+}
+
+cmd_help() {
+  cat <<EOF
+$COMMAND $VERSION - on-screen keyboard for the ASUS ROG Zephyrus Duo
+
+Seating the magnetic keyboard (USB 0b05:1ce6) hides wvkbd. Lifting it leaves
+the keyboard hidden unless show_keyboard=true. Screen rotation is
+zephyrus-duo-rotate, not this plugin.
+
+Setup
+  install               Build wvkbd-deskus from this plugin's reviewed recipe, if needed
+  enable                Start the service, add the menu entries and the bar icon
+  disable [--full]      Stop the service and the on-screen keyboard.
+                        --full also removes the menu entries and the bar icon
+  uninstall [--packages]
+                        disable --full, then remove the service (and wvkbd-deskus)
+  doctor                Check wvkbd, panels, the rotator, and the dock id
+
+Use
+  status [--json]       Dock (seated or lifted), the pinned output, and whether the
+                        keyboard is shown (--is enabled|running|osk|seated|lifted)
+  on | off | toggle     Show or hide the on-screen keyboard until 0b05:1ce6 next appears
+  osk show|hide|toggle  Same visibility commands
+  restore               Stop wvkbd (the service does this itself when it stops)
+
+rotate, lock, and calibrate are refused. Use zephyrus-duo-rotate.
+
+Settings: $CONF
+EOF
+}
+
+# Sourced by the tests for its functions; nothing runs.
+[[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
+
+case ${1:-help} in
+  install | enable | disable | restore | status | doctor | daemon | uninstall | help) cmd="cmd_$1" && shift && "$cmd" "$@" ;;
+  on | off | toggle) cmd_mode "$1" ;;
+  osk) shift && cmd_osk "$@" ;;
+  rotate | lock | calibrate) refuse_rotation ;;
+  plugin-toggle) cmd_plugin_toggle ;;
+  setup-state) load_config && setup_state ;;
+  enabled) load_config && cfg_bool enabled ;;
+  send) shift && send "$*" ;;
+  _usb-reader) cmd__usb_reader ;;
+  _hypr-reader) cmd__hypr_reader ;;
+  _sleep-reader) cmd__sleep_reader ;;
+  -h | --help) cmd_help ;;
+  -v | --version) echo "$VERSION" ;;
+  *) cmd_help && exit 1 ;;
+esac

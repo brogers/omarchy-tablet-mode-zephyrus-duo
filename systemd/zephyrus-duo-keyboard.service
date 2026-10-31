@@ -1,0 +1,25 @@
+[Unit]
+Description=On-screen keyboard for the ASUS ROG Zephyrus Duo
+Documentation=https://github.com/brogers/omarchy-tablet-mode-zephyrus-duo
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+
+[Service]
+Type=simple
+# `zephyrus-duo-keyboard disable` sets enabled=false; then nothing runs, even if the unit is started.
+ExecCondition=@BIN@ enabled
+ExecStart=@BIN@ daemon
+# Stop hides and stops wvkbd. It does not move panels, change gaps, or touch the accelerometer.
+ExecStopPost=@BIN@ restore --quiet
+# Stop signals go to the daemon alone, so it hides the on-screen keyboard (which lets go of a
+# held key) before killing it. wvkbd has no SIGTERM handler, so with the default (SIGTERM
+# to every process at once) it could die with a key still pressed. On a requested stop,
+# ExecStopPost runs before anything left over is killed.
+KillMode=mixed
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

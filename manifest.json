@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "alanroman117.tablet-mode",
-  "name": "Tablet Mode (ROG Flow Z13)",
+  "id": "brogers.zephyrus-duo-keyboard",
+  "name": "Zephyrus Duo Keyboard",
   "version": "0.1.2",
-  "author": "Alan Roman",
+  "author": "brogers",
   "license": "MIT",
-  "description": "Tablet mode for detachables: auto-rotation, an on-screen keyboard and touch tweaks when the keyboard comes off, and a switch back to plain Omarchy.",
+  "description": "On-screen keyboard for the ASUS ROG Zephyrus Duo: show wvkbd-deskus on the bottom panel, and hide it when the magnetic keyboard is seated.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,8 +13,8 @@
     "barWidget": "Widget.qml"
   },
   "barWidget": {
-    "displayName": "Tablet Mode",
-    "description": "Tablet mode card: switch modes, show the on-screen keyboard, lock or turn the screen, or disable it all.",
+    "displayName": "Zephyrus Duo Keyboard",
+    "description": "Dock status (seated or lifted), the on-screen keyboard switch, Check, and Turn off.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"

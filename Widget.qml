@@ -1,5 +1,5 @@
 import QtQuick
-// Namespaced so Controls' Button and ButtonGroup don't shadow the qs.Ui ones.
+// Namespaced so Controls' Button doesn't shadow the qs.Ui one.
 import QtQuick.Controls as Controls
 import Quickshell
 import Quickshell.Io
@@ -8,40 +8,40 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 
-// Tablet mode: bar icon plus a touch-sized card in the style of Omarchy's own
-// panels. The card switches modes, shows the on-screen keyboard, locks or turns
-// the screen, and turns the whole plugin off (plain Omarchy). Everything goes
-// through bin/tablet-mode; live state comes from the daemon's state file.
+// Zephyrus Duo keyboard: bar icon plus a touch-sized card. The card shows whether
+// the magnetic keyboard is seated or lifted, shows the on-screen keyboard, and
+// turns the plugin off. Everything goes through bin/zephyrus-duo-keyboard; live
+// state comes from the daemon's state file.
 Panel {
   id: root
-  moduleName: "alanroman117.tablet-mode"
-  ipcTarget: "alanroman117.tablet-mode"
+  moduleName: "brogers.zephyrus-duo-keyboard"
+  ipcTarget: "brogers.zephyrus-duo-keyboard"
   // Own the IPC target so it can also carry refresh().
   manageIpc: false
 
-  // From `tablet-mode status --json`.
+  // From `zephyrus-duo-keyboard status --json`.
   property var info: ({})
   property string busy: ""
   property string actionError: ""
 
-  readonly property string cli: decodeURIComponent(Qt.resolvedUrl("bin/tablet-mode").toString().replace("file://", ""))
+  readonly property string cli: decodeURIComponent(Qt.resolvedUrl("bin/zephyrus-duo-keyboard").toString().replace("file://", ""))
   // The daemon's folder. Without XDG_RUNTIME_DIR nothing is watched (the timer still refreshes):
   // a guessed shared path like /tmp could be someone else's file.
-  readonly property string runDir: Quickshell.env("XDG_RUNTIME_DIR") ? Quickshell.env("XDG_RUNTIME_DIR") + "/omarchy-tablet-mode" : ""
+  readonly property string runDir: Quickshell.env("XDG_RUNTIME_DIR") ? Quickshell.env("XDG_RUNTIME_DIR") + "/zephyrus-duo-keyboard" : ""
   readonly property string setup: info.setup || "unknown"
   readonly property bool ready: setup === "ready"
-  readonly property bool tablet: ready && info.mode === "tablet"
-  readonly property var rotations: ["normal", "90", "180", "270"]
+  readonly property bool daemonUp: !!info.running
+  readonly property bool lifted: info.dock === "lifted"
+  readonly property bool seated: info.dock === "seated"
 
-  // The bar makes one widget per monitor; only the one on the built-in display shows the
-  // floating keyboard button.
+  // The bar makes one widget per monitor. The floating button is on each eDP bar.
   readonly property var barScreen: button.QsWindow.window ? button.QsWindow.window.screen : null
-  readonly property bool onInternalScreen: barScreen !== null && /^(eDP|LVDS|DSI)/.test(String(barScreen.name || ""))
+  readonly property bool onEdp: barScreen !== null && /^eDP/.test(String(barScreen.name || ""))
   readonly property string keyboardGlyph: "\udb80\udf0c"
   readonly property string keyboardCloseGlyph: "\udb80\udf0f"
 
-  readonly property string tabletGlyph: "󰓶"
-  readonly property string laptopGlyph: "󰌢"
+  readonly property string liftedGlyph: "󰓶"
+  readonly property string seatedGlyph: "󰌢"
 
   // The bar API handed to third-party plugins has run() but not shellQuote(),
   // so quote locally.
@@ -69,7 +69,7 @@ Panel {
     actionProc.running = true
   }
 
-  // Install asks for a password, and calibrate and doctor talk to you, so they get a terminal.
+  // Install asks for a password, and doctor talks to you, so they get a terminal.
   function openTerminal(command) {
     if (!bar) return
     close()
@@ -80,39 +80,37 @@ Panel {
   function statusCaption() {
     if (busy === "disable") return "TURNING OFF..."
     if (busy === "enable") return "STARTING..."
-    if (setup === "disabled") return "OFF: PLAIN OMARCHY"
+    if (setup === "disabled") return "OFF"
     if (setup === "install") return "NOT SET UP"
     if (setup === "enable") return "ONE STEP LEFT"
     if (setup === "stopped") return "STOPPED"
     if (setup !== "ready") return ""
-    if (tablet && info.desk) return "TABLET MODE · DESK"
-    return tablet ? "TABLET MODE" : "LAPTOP MODE"
-  }
-
-  function setupText() {
-    if (setup === "disabled") return "Turned off. Nothing runs and nothing is changed: rotation, the on-screen keyboard and the touch tweaks are all back to plain Omarchy."
-    if (setup === "install") return "Needs iio-sensor-proxy (reads the accelerometer) and wvkbd (the on-screen keyboard). Setup installs them; it asks for your password."
-    if (setup === "enable") return "Installed. Last step: start the service and add the menu entries."
-    if (setup === "stopped") return "The tablet-mode service isn't running."
+    if (seated) return "SEATED"
+    if (lifted) return "LIFTED"
     return ""
   }
 
-  function modeSubtitle() {
-    if (actionError !== "") return actionError
-    if (tablet && info.desk) return "Laptop screen off: keyboard and touch tweaks wait for it"
-    if (info.source === "manual") return tablet ? "Turned on by hand" : "Turned off by hand"
-    if (info.keyboard === "detached") return "Keyboard detached"
-    if (info.keyboard === "attached") return "Keyboard attached"
-    return "Detach the keyboard, or switch here"
+  function setupText() {
+    if (setup === "disabled") return "Turned off. The service is stopped and the on-screen keyboard is hidden."
+    if (setup === "install") return "Needs wvkbd-deskus, the on-screen keyboard. Setup installs it and asks for your password."
+    if (setup === "enable") return "Installed. Last step: start the service and add the menu entries."
+    if (setup === "stopped") return "The keyboard service isn't running."
+    return ""
   }
 
-  function rotationSubtitle() {
-    if (info.lock) return "Locked where it is"
-    return tablet ? "Following the accelerometer" : "Follows the accelerometer in tablet mode"
+  function dockText() {
+    if (seated) return "Seated on the bottom panel"
+    if (lifted) return "Lifted"
+    return "Unknown"
+  }
+
+  function oskSubtitle() {
+    if (info.osk && info.osk_output) return "Shown on " + info.osk_output
+    return info.osk ? "Shown" : "Hidden"
   }
 
   IpcHandler {
-    target: "alanroman117.tablet-mode"
+    target: "brogers.zephyrus-duo-keyboard"
 
     function open(): void { root.open() }
     function close(): void { root.close() }
@@ -178,19 +176,20 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  // Floating keyboard button, in tablet mode only: one tap shows the on-screen keyboard,
-  // another hides it. It keeps out of other surfaces' exclusive zones, so while the keyboard
-  // is up it sits just above it, within thumb reach either way.
+  // Floating keyboard button on each eDP bar, only while the daemon is running and
+  // the keyboard is lifted. One tap shows the on-screen keyboard, another hides it.
+  // It keeps out of other surfaces' exclusive zones, so while the keyboard is up
+  // it sits just above it, within thumb reach either way.
   PanelWindow {
     id: oskButton
     screen: root.barScreen
-    visible: root.tablet && root.onInternalScreen
+    visible: root.daemonUp && root.lifted && root.onEdp
     anchors { bottom: true; right: true }
     margins { bottom: Style.space(18); right: Style.space(18) }
     implicitWidth: Style.space(64)
     implicitHeight: Style.space(64)
     color: "transparent"
-    WlrLayershell.namespace: "tablet-mode-keyboard-button"
+    WlrLayershell.namespace: "zephyrus-duo-keyboard-button"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Normal
@@ -224,12 +223,12 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.tablet ? root.tabletGlyph : root.laptopGlyph
-    active: root.tablet
+    text: root.lifted ? root.liftedGlyph : root.seatedGlyph
+    active: root.daemonUp && root.lifted
     dimmed: !root.ready
     tooltipText: root.opened ? "" : (root.ready
-      ? (root.tablet ? "Tablet mode" : "Laptop mode") + (root.info.lock ? ", rotation locked" : "")
-      : (root.setup === "disabled" ? "Tablet mode: off" : "Tablet mode: not set up"))
+      ? (root.seated ? "Keyboard seated" : (root.lifted ? "Keyboard lifted" : "Zephyrus Duo keyboard"))
+      : (root.setup === "disabled" ? "Zephyrus Duo keyboard: off" : "Zephyrus Duo keyboard: not set up"))
     onPressed: function(b) { root.toggle() }
   }
 
@@ -249,8 +248,8 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      // The card is capped at the screen's height, so on a short screen (scale 4 on the Z13
-      // leaves 400 logical px) the content scrolls instead of losing its bottom row.
+      // The card is capped at the screen's height, so on a short screen the content
+      // scrolls instead of losing its bottom row.
       Controls.ScrollView {
         id: scrollArea
         anchors.fill: parent
@@ -268,7 +267,7 @@ Panel {
           width: scrollArea.availableWidth
           spacing: Style.space(14)
 
-          // ---------- Hero: icon, title/status, keyboard ----------
+          // ---------- Hero: icon, title/status, dock ----------
           Item {
             width: parent.width
             implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroValue.implicitHeight)
@@ -276,7 +275,7 @@ Panel {
             Text {
               id: heroIcon
               textFormat: Text.PlainText
-              text: root.tablet ? root.tabletGlyph : root.laptopGlyph
+              text: root.lifted ? root.liftedGlyph : root.seatedGlyph
               color: root.bar.foreground
               opacity: root.ready ? 1 : 0.45
               font.family: root.bar.fontFamily
@@ -295,7 +294,7 @@ Panel {
               spacing: Style.space(2)
 
               Text {
-                text: "Tablet Mode"
+                text: "Keyboard"
                 color: root.bar.foreground
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.title
@@ -319,14 +318,14 @@ Panel {
 
             Column {
               id: heroValue
-              visible: root.ready && root.info.keyboard !== "unknown"
+              visible: root.seated || root.lifted
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
 
               Text {
                 anchors.right: parent.right
                 textFormat: Text.PlainText
-                text: root.info.keyboard === "detached" ? "Off" : "On"
+                text: root.seated ? "Seated" : "Lifted"
                 color: root.bar.foreground
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.title
@@ -335,7 +334,7 @@ Panel {
 
               Text {
                 anchors.right: parent.right
-                text: "KEYBOARD"
+                text: "DOCK"
                 color: Qt.darker(root.bar.foreground, 1.4)
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
@@ -392,74 +391,50 @@ Panel {
             }
           }
 
-          // ---------- Switches ----------
+          // ---------- Dock status and the on-screen keyboard ----------
           Column {
             visible: root.ready
             width: parent.width
             spacing: Style.space(12)
 
-            SwitchRow {
-              title: "Tablet mode"
-              subtitle: root.modeSubtitle()
-              warn: root.actionError !== ""
-              checked: root.tablet
-              onToggled: root.runAction("mode", ["toggle"])
+            Item {
+              width: parent.width
+              implicitHeight: dockLabels.implicitHeight
+
+              Column {
+                id: dockLabels
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: Style.space(2)
+
+                Text {
+                  text: "Dock"
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.body
+                  width: parent.width
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.dockText()
+                  color: root.bar.foreground
+                  opacity: 0.6
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                }
+              }
             }
 
             SwitchRow {
               title: "On-screen keyboard"
-              subtitle: root.info.osk ? "Shown" : "Hidden"
+              subtitle: root.actionError !== "" ? root.actionError : root.oskSubtitle()
+              warn: root.actionError !== ""
               checked: !!root.info.osk
               onToggled: root.runAction("osk", ["osk", "toggle"])
-            }
-
-            SwitchRow {
-              title: "Rotation lock"
-              subtitle: root.rotationSubtitle()
-              checked: !!root.info.lock
-              onToggled: root.runAction("lock", ["lock", "toggle"])
-            }
-          }
-
-          PanelSeparator { visible: root.ready; foreground: root.bar.foreground }
-
-          // ---------- Turn the screen ----------
-          Column {
-            visible: root.ready
-            width: parent.width
-            spacing: Style.space(8)
-
-            PanelSectionHeader {
-              text: "TURN THE SCREEN"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-            }
-
-            ButtonGroup {
-              width: parent.width
-              options: [
-                { value: "normal", label: "0°" },
-                { value: "90", label: "90°" },
-                { value: "180", label: "180°" },
-                { value: "270", label: "270°" }
-              ]
-              value: root.rotations[root.info.transform || 0] || "normal"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              fontSize: Style.font.bodySmall
-              focusable: false
-              onChanged: function(value) { root.runAction("rotate", ["rotate", value]) }
-            }
-
-            Text {
-              textFormat: Text.PlainText
-              text: "Picking one locks rotation. Upside down or sideways when you turn it? Calibrate."
-              color: root.bar.foreground
-              opacity: 0.6
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-              width: parent.width
             }
           }
 
@@ -470,18 +445,7 @@ Panel {
             visible: root.ready
             width: parent.width
             spacing: Style.space(6)
-            readonly property real cellWidth: (width - spacing * 2) / 3
-
-            Button {
-              width: toolsRow.cellWidth
-              iconText: "󰑵"
-              text: "Calibrate"
-              fontSize: Style.font.bodySmall
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              bordered: true
-              onClicked: root.openTerminal("calibrate")
-            }
+            readonly property real cellWidth: (width - spacing) / 2
 
             Button {
               width: toolsRow.cellWidth
@@ -498,7 +462,7 @@ Panel {
               width: toolsRow.cellWidth
               iconText: "󰐥"
               text: "Turn off"
-              tooltipText: "Plain Omarchy: stop everything and undo every change"
+              tooltipText: "Stop the service and hide the on-screen keyboard"
               fontSize: Style.font.bodySmall
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
