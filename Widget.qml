@@ -224,7 +224,6 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: root.lifted ? root.liftedGlyph : root.seatedGlyph
-    active: root.daemonUp && root.lifted
     dimmed: !root.ready
     tooltipText: root.opened ? "" : (root.ready
       ? (root.seated ? "Keyboard seated" : (root.lifted ? "Keyboard lifted" : "Zephyrus Duo keyboard"))
