@@ -34,9 +34,31 @@ Panel {
   readonly property bool lifted: info.dock === "lifted"
   readonly property bool seated: info.dock === "seated"
 
-  // The bar makes one widget per monitor. The floating button is on each eDP bar.
+  // The bar makes one widget per monitor. The floating button follows the panel
+  // the keyboard is pinned to once a second screen is connected.
   readonly property var barScreen: button.QsWindow.window ? button.QsWindow.window.screen : null
   readonly property bool onEdp: barScreen !== null && /^eDP/.test(String(barScreen.name || ""))
+  readonly property bool onKeyboardScreen: {
+    if (!onEdp) return false
+    var screens = Quickshell.screens
+    var count = screens ? screens.length : 0
+    if (count <= 1) return true
+    var name = String(barScreen.name || "")
+    var target = String(info.osk_output || "")
+    if (target !== "") return name === target
+    // Status has not named a panel yet. The lower internal screen is the bottom one.
+    var lowest = name
+    var lowestY = barScreen.y
+    for (var i = 0; i < count; i++) {
+      var screen = screens[i]
+      if (!screen || !/^eDP/.test(String(screen.name || ""))) continue
+      if (screen.y > lowestY) {
+        lowestY = screen.y
+        lowest = String(screen.name || "")
+      }
+    }
+    return name === lowest
+  }
   readonly property string keyboardGlyph: "\udb80\udf0c"
   readonly property string keyboardCloseGlyph: "\udb80\udf0f"
 
@@ -176,14 +198,15 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  // Floating keyboard button on each eDP bar, only while the daemon is running and
-  // the keyboard is lifted. One tap shows the on-screen keyboard, another hides it.
+  // Floating keyboard button on the bottom panel while the daemon is running and
+  // the keyboard is lifted. A single screen keeps the button. One tap shows the
+  // on-screen keyboard, another hides it.
   // It keeps out of other surfaces' exclusive zones, so while the keyboard is up
   // it sits just above it, within thumb reach either way.
   PanelWindow {
     id: oskButton
     screen: root.barScreen
-    visible: root.daemonUp && root.lifted && root.onEdp
+    visible: root.daemonUp && root.lifted && root.onKeyboardScreen
     anchors { bottom: true; right: true }
     margins { bottom: Style.space(18); right: Style.space(18) }
     implicitWidth: Style.space(64)

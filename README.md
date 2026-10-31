@@ -25,7 +25,7 @@ Docked means USB product `1ce6` is on the bus (`0b05:1ce6`), the same test as `z
 
 A dock, a lift, or a rotation while the keyboard is lifted runs `hyprctl reload` from the other Duo scripts. If the on-screen keyboard was visible, this plugin shows it again on the current bottom connector. It writes no layout rules.
 
-A round keyboard button floats on both internal screens, and only while the magnetic keyboard is lifted and this service is running.
+A round keyboard button floats on the bottom panel, and only while the magnetic keyboard is lifted and this service is running. With one screen, it stays on that screen.
 
 ## Requirements
 
@@ -60,7 +60,7 @@ Before the service is running, the card offers **Set up**, **Finish setup**, **S
 
 The same controls are in the Omarchy menu under **Trigger → Toggle**: **On-screen Keyboard**, and **Zephyrus Duo Keyboard** to turn the plugin on or off.
 
-The floating button uses the layer namespace `zephyrus-duo-keyboard-button`. It is on each `eDP` bar only while the daemon is running and the keyboard is lifted.
+The floating button uses the layer namespace `zephyrus-duo-keyboard-button`. It is on the connector from `zephyrus-duo-panels` while the daemon is running and the keyboard is lifted. With one screen, it stays on that internal screen.
 
 ## Commands
 
