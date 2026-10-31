@@ -55,6 +55,7 @@ declare -A CFG=(
   [keyboard]=0b05:1ce6
   [auto_rotate]=false
   [show_keyboard]=false
+  [floating_button]=true
   [touch_tweaks]=false
   [notify]=true
   [resume_delay_ms]=2000
@@ -98,6 +99,9 @@ auto_rotate=false
 # true = show the on-screen keyboard whenever the magnetic keyboard is lifted.
 # Leave false when another keyboard (a Corne, for example) is in use.
 show_keyboard=false
+
+# true = the round button floats on the bottom panel while the keyboard is lifted.
+floating_button=true
 
 # Ignored. This plugin does not change Hyprland gaps.
 touch_tweaks=false
@@ -602,6 +606,19 @@ cmd_osk() {
   esac
 }
 
+# The floating button is drawn by the widget. The daemon does not read this.
+cmd_button() {
+  load_config
+  local next=true
+  case ${1:-toggle} in
+    on) next=true ;;
+    off) next=false ;;
+    toggle) if cfg_bool floating_button; then next=false; else next=true; fi ;;
+    *) die "Usage: $COMMAND button on|off|toggle" ;;
+  esac
+  set_config floating_button "$next"
+}
+
 packages_missing() {
   command -v wvkbd-deskus >/dev/null || echo wvkbd-deskus
 }
@@ -628,15 +645,18 @@ setup_state() {
 }
 
 status_json() {
-  local live='{}' enabled=false dock out
+  local live='{}' enabled=false dock out button=false
   daemon_running >/dev/null && [[ -f $STATE ]] && live=$(cat "$STATE")
   cfg_bool enabled && enabled=true
+  cfg_bool floating_button && button=true
   dock=$(dock_state)
   out=$(osk_output 2>/dev/null || true)
-  jq -c --argjson enabled "$enabled" --arg setup "$(setup_state)" --arg version "$VERSION" \
+  jq -c --argjson enabled "$enabled" --argjson floating_button "$button" \
+    --arg setup "$(setup_state)" --arg version "$VERSION" \
     --arg keyboard "${CFG[keyboard]}" --arg dock "$dock" --arg osk_output "$out" \
     '{version: $version, enabled: $enabled, setup: $setup, keyboard: $keyboard,
-      dock: $dock, osk_output: $osk_output, running: false, osk: false} + .' <<<"$live"
+      dock: $dock, osk_output: $osk_output, floating_button: $floating_button,
+      running: false, osk: false} + .' <<<"$live"
 }
 
 cmd_status() {
@@ -669,7 +689,8 @@ cmd_status() {
     "  service      \(if .running then "running" else "not running" end)",
     "  dock         \(.dock) (\(.keyboard))",
     "  on-screen kb \(if .osk then "shown" else "hidden" end)",
-    "  output       \(.osk_output)"' <<<"$st"
+    "  output       \(.osk_output)",
+    "  button       \(if .floating_button then "shown" else "hidden" end)"' <<<"$st"
 }
 
 BUILD_DIR=""
@@ -1020,6 +1041,7 @@ Use
                         keyboard is shown (--is enabled|running|osk|seated|lifted)
   on | off | toggle     Show or hide the on-screen keyboard until 0b05:1ce6 next appears
   osk show|hide|toggle  Same visibility commands
+  button on|off|toggle  Show or hide the floating keyboard button
   restore               Stop wvkbd (the service does this itself when it stops)
 
 rotate, lock, and calibrate are refused. Use zephyrus-duo-rotate.
@@ -1035,6 +1057,7 @@ case ${1:-help} in
   install | enable | disable | restore | status | doctor | daemon | uninstall | help) cmd="cmd_$1" && shift && "$cmd" "$@" ;;
   on | off | toggle) cmd_mode "$1" ;;
   osk) shift && cmd_osk "$@" ;;
+  button) shift && cmd_button "$@" ;;
   rotate | lock | calibrate) refuse_rotation ;;
   plugin-toggle) cmd_plugin_toggle ;;
   setup-state) load_config && setup_state ;;

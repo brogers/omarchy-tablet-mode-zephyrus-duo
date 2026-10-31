@@ -23,6 +23,7 @@ Panel {
   property var info: ({})
   property string busy: ""
   property string actionError: ""
+  property string actionErrorOn: ""
 
   readonly property string cli: decodeURIComponent(Qt.resolvedUrl("bin/zephyrus-duo-keyboard").toString().replace("file://", ""))
   // The daemon's folder. Without XDG_RUNTIME_DIR nothing is watched (the timer still refreshes):
@@ -33,6 +34,8 @@ Panel {
   readonly property bool daemonUp: !!info.running
   readonly property bool lifted: info.dock === "lifted"
   readonly property bool seated: info.dock === "seated"
+  // Missing means on, so a config written before this setting still shows the button.
+  readonly property bool floatingButton: info.floating_button !== false
 
   // The bar makes one widget per monitor. The floating button follows the panel
   // the keyboard is pinned to once a second screen is connected.
@@ -87,6 +90,7 @@ Panel {
     if (busy !== "") return
     busy = kind
     actionError = ""
+    actionErrorOn = ""
     actionProc.command = [cli].concat(args)
     actionProc.running = true
   }
@@ -131,6 +135,10 @@ Panel {
     return info.osk ? "Shown" : "Hidden"
   }
 
+  function buttonSubtitle() {
+    return floatingButton ? "Shown while the keyboard is lifted" : "Hidden"
+  }
+
   IpcHandler {
     target: "brogers.zephyrus-duo-keyboard"
 
@@ -145,6 +153,7 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       actionError = ""
+      actionErrorOn = ""
       refresh()
     }
   }
@@ -176,6 +185,7 @@ Panel {
       if (exitCode !== 0) {
         var lines = String(actionErr.text || "").trim().split("\n")
         root.actionError = lines[lines.length - 1].replace(/^.*Error:\s*/, "") || "That didn't work"
+        root.actionErrorOn = root.busy
       }
       root.busy = ""
       root.refreshAll()
@@ -206,7 +216,7 @@ Panel {
   PanelWindow {
     id: oskButton
     screen: root.barScreen
-    visible: root.daemonUp && root.lifted && root.onKeyboardScreen
+    visible: root.daemonUp && root.lifted && root.onKeyboardScreen && root.floatingButton
     anchors { bottom: true; right: true }
     margins { bottom: Style.space(18); right: Style.space(18) }
     implicitWidth: Style.space(64)
@@ -453,10 +463,18 @@ Panel {
 
             SwitchRow {
               title: "On-screen keyboard"
-              subtitle: root.actionError !== "" ? root.actionError : root.oskSubtitle()
-              warn: root.actionError !== ""
+              subtitle: root.actionErrorOn === "osk" && root.actionError !== "" ? root.actionError : root.oskSubtitle()
+              warn: root.actionErrorOn === "osk" && root.actionError !== ""
               checked: !!root.info.osk
               onToggled: root.runAction("osk", ["osk", "toggle"])
+            }
+
+            SwitchRow {
+              title: "Floating button"
+              subtitle: root.actionErrorOn === "button" && root.actionError !== "" ? root.actionError : root.buttonSubtitle()
+              warn: root.actionErrorOn === "button" && root.actionError !== ""
+              checked: root.floatingButton
+              onToggled: root.runAction("button", ["button", "toggle"])
             }
           }
 

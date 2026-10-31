@@ -54,13 +54,14 @@ Tap the bar icon:
 
 - **Dock**: seated or lifted.
 - **On-screen keyboard** switch.
+- **Floating button** switch.
 - **Check** (runs `doctor`) and **Turn off**.
 
 Before the service is running, the card offers **Set up**, **Finish setup**, **Start**, or **Turn on**, plus **Check**.
 
 The same controls are in the Omarchy menu under **Trigger → Toggle**: **On-screen Keyboard**, and **Zephyrus Duo Keyboard** to turn the plugin on or off.
 
-The floating button uses the layer namespace `zephyrus-duo-keyboard-button`. It is on the connector from `zephyrus-duo-panels` while the daemon is running and the keyboard is lifted. With one screen, it stays on that internal screen.
+The floating button uses the layer namespace `zephyrus-duo-keyboard-button`. It is on the connector from `zephyrus-duo-panels` while the daemon is running and the keyboard is lifted. With one screen, it stays on that internal screen. The card's **Floating button** switch hides it.
 
 ## Commands
 
@@ -69,6 +70,7 @@ zephyrus-duo-keyboard status            # dock, pinned output, whether the keybo
 zephyrus-duo-keyboard status --json
 zephyrus-duo-keyboard on|off|toggle     # until 0b05:1ce6 next appears, which hides it
 zephyrus-duo-keyboard osk show|hide|toggle
+zephyrus-duo-keyboard button on|off|toggle   # the floating button
 zephyrus-duo-keyboard doctor            # wvkbd, panels, the rotator, and the dock id
 ```
 
@@ -99,6 +101,7 @@ enabled=true
 keyboard=0b05:1ce6
 auto_rotate=false
 show_keyboard=false
+floating_button=true
 touch_tweaks=false
 ```
 
@@ -107,6 +110,7 @@ touch_tweaks=false
 | `enabled` | `true` | `false` means the service exits and nothing starts at login |
 | `keyboard` | `0b05:1ce6` | USB id that means seated. Present hides the on-screen keyboard |
 | `show_keyboard` | `false` | `true` shows the on-screen keyboard on every lift. Leave this off when another keyboard is in use |
+| `floating_button` | `true` | `false` hides the round button. A config without this key still shows it |
 | `auto_rotate` | `false` | Ignored. Rotation is `zephyrus-duo-rotate` |
 | `touch_tweaks` | `false` | Ignored. This plugin does not change gaps |
 
@@ -126,7 +130,7 @@ Before sleep the service hides the on-screen keyboard. It does not take a logind
 
 `wvkbd-deskus --output` is pinned to `bottom` from `eval "$(zephyrus-duo-panels)"`, or to `top` when `bottom` is empty (booted while docked, so the bottom panel was never detected). A name that is not a connector token is refused.
 
-State goes to `$XDG_RUNTIME_DIR/zephyrus-duo-keyboard/state.json`, which the card watches. `status --json` includes `dock` (`seated` or `lifted`) and `osk_output`.
+State goes to `$XDG_RUNTIME_DIR/zephyrus-duo-keyboard/state.json`, which the card watches. `status --json` includes `dock` (`seated` or `lifted`), `osk_output`, and `floating_button`.
 
 `doctor` checks that `wvkbd-deskus` is installed, `zephyrus-duo-panels` returns a top panel, `zephyrus-duo-rotate` is running, this process has no `monitor-sensor` child, and `keyboard` is `0b05:1ce6`. It prints seated or lifted, and the output it would pin to.
 
